@@ -10,7 +10,8 @@ import json
 from types import SimpleNamespace
 
 import pytest
-
+from analytics.analytics_engine import AnalyticsEngine
+from analytics.config import AnalyticsConfig
 from analytics.consent import CONSENT_SCHEMA_VERSION
 from analytics.export_manager import (
     EXPORT_RECEIPT_VERSION,
@@ -26,6 +27,7 @@ RECEIPT_KEYS = {
     "completed_at_epoch_seconds",
     "scope",
     "policy_revision",
+    "consent_policy_revision",
     "consent_schema_version",
     "redaction_version",
     "format_version",
@@ -123,6 +125,53 @@ def test_receipt_records_scope_policy_revision_and_output_digest():
     assert receipt["format_version"] == art.schema_version
     assert receipt["payload_bytes"] == len(serialized.encode("utf-8"))
     assert count == 2
+
+
+@pytest.mark.parametrize(
+    ("include_revision", "expected_revision"),
+    [(True, "consent-policy-v7"), (False, None)],
+)
+def test_receipt_records_the_configured_collection_consent_revision(
+    include_revision, expected_revision
+):
+    config = AnalyticsConfig(consent_policy_revision="consent-policy-v7")
+    config.export.include_consent_policy_revision = include_revision
+    engine = AnalyticsEngine(config=config)
+    entry = engine.log_processor.sanitize_error_context(ValueError("safe error"))
+
+    art, _, _ = _export(_manager(), [entry])
+
+    assert entry.consent_policy_revision == expected_revision
+    assert art.receipt["consent_policy_revision"] == expected_revision
+
+
+def test_receipt_revision_only_covers_entries_kept_by_the_entry_limit():
+    mgr = _manager(max_artifacts_per_export=1)
+    entries = [
+        _entry("first", ts=1.0, consent_policy_revision="rev-a"),
+        _entry("second", ts=2.0, consent_policy_revision="rev-b"),
+    ]
+
+    art, serialized, count = _export(mgr, entries)
+
+    assert count == 1
+    assert "rev-b" not in serialized
+    assert art.consent_policy_revision == "rev-a"
+    assert art.receipt["consent_policy_revision"] == "rev-a"
+
+
+def test_receipt_revision_only_covers_entries_kept_by_the_byte_limit():
+    first = _entry("first", ts=1.0, consent_policy_revision="rev-a")
+    second = _entry("second", ts=2.0, consent_policy_revision="rev-b")
+    _, single_entry_payload, _ = _export(_manager(), [first])
+    mgr = _manager(max_artifact_bytes=len(single_entry_payload.encode("utf-8")))
+
+    art, serialized, count = _export(mgr, [first, second])
+
+    assert count == 1
+    assert "rev-b" not in serialized
+    assert art.consent_policy_revision == "rev-a"
+    assert art.receipt["consent_policy_revision"] == "rev-a"
 
 
 def test_output_digest_matches_the_exported_output():
@@ -244,16 +293,23 @@ def test_receipt_holds_no_private_data_even_for_compressed_exports():
 # ------------------------------------------------------ failure / boundary cases
 
 
-def test_unverified_export_gets_a_receipt_for_an_empty_output():
+@pytest.mark.parametrize("candidate_count", [0, 1, 4])
+def test_unverified_shadow_receipt_does_not_reveal_candidate_data(candidate_count):
     mgr = _manager()
-    art, serialized, count = mgr.create_export(entries=[_private_entry()], export_token_verified=False)
+    entries = [
+        _entry(str(index), consent_policy_revision=f"consent-policy-{index}")
+        for index in range(candidate_count)
+    ]
+    art, serialized, count = mgr.create_export(entries=entries, export_token_verified=False)
 
     assert count == 0
     scope = art.receipt["scope"]
-    assert (scope["candidate_count"], scope["exported_count"], scope["export_token_verified"]) == (1, 0, False)
+    assert (scope["candidate_count"], scope["exported_count"], scope["export_token_verified"]) == (None, 0, False)
+    assert art.receipt["consent_policy_revision"] is None
     assert art.receipt["output_digest"] == "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     blob = json.dumps(art.receipt)
-    assert PRIVATE_VALUES[1] not in blob
+    for entry in entries:
+        assert entry.consent_policy_revision not in blob
 
 
 def test_rejected_export_produces_no_receipt():

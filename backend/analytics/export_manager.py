@@ -342,7 +342,6 @@ class ExportManager:
                     safety_sig = self.compute_safety_signature(entries_filtered)
             else:
                 safety_sig = None
-            consent_revision, consent_state = resolve_consent_state(entries_filtered)
             if not export_token_verified:
                 entries_filtered = []
             entries_filtered = entries_filtered[:policy.max_artifacts_per_export]
@@ -357,6 +356,11 @@ class ExportManager:
             else:
                 serialized = "[]"
                 count = 0
+            exported_entries = sorted(
+                entries_filtered,
+                key=lambda entry: entry.timestamp_epoch_seconds,
+            )[:count]
+            consent_revision, consent_state = resolve_consent_state(exported_entries)
             payload_bytes = len(serialized.encode("utf-8"))
             output_digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
             checksum = output_digest[:16]
@@ -419,7 +423,7 @@ class ExportManager:
                     if isinstance(requested_max_entries, int) and not isinstance(requested_max_entries, bool)
                     else None
                 ),
-                "candidate_count": candidate_count,
+                "candidate_count": candidate_count if export_token_verified else None,
                 "exported_count": artifact.entry_count,
                 "max_entries": policy.max_artifacts_per_export,
                 "max_bytes": policy.max_artifact_bytes,
@@ -429,6 +433,9 @@ class ExportManager:
                 "rollout_phase": artifact.rollout_phase,
             },
             "policy_revision": export_policy_revision(policy),
+            "consent_policy_revision": (
+                artifact.consent_policy_revision if export_token_verified else None
+            ),
             "consent_schema_version": CONSENT_SCHEMA_VERSION,
             "redaction_version": artifact.redaction_version,
             "format_version": artifact.schema_version,
