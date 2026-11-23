@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import psycopg
@@ -1213,96 +1213,21 @@ DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT = 10
 DEADLINE_EXCEEDED_REASON = "processing_deadline_exceeded"
 
 
-class TenantQueueLimitExceededError(Exception):
-    """Raised when a tenant exceeds the per-tenant queued video job bound."""
-
-    def __init__(
-        self,
-        *,
-        tenant_id: str,
-        limit: int,
-        queued_count: int,
-        job_type: str,
-    ) -> None:
-        super().__init__(
-            f"tenant '{tenant_id}' exceeded queued {job_type} job limit ({queued_count}/{limit})"
-        )
-        self.tenant_id = tenant_id
-        self.limit = limit
-        self.queued_count = queued_count
-        self.job_type = job_type
+DEFAULT_CANCELLATION_REASON = "Job cancelled"
 
 
-def max_concurrent_video_jobs_per_tenant() -> int:
-    """Maximum concurrent expensive video jobs allowed per tenant."""
-    return _positive_int_env(
-        "WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT",
-        DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT,
+def _cancelled_result(reason: str | None = None) -> dict[str, Any]:
+    """Build the stable cancelled result payload returned to requesters."""
+    text = (
+        reason.strip()
+        if isinstance(reason, str) and reason.strip()
+        else DEFAULT_CANCELLATION_REASON
     )
+    return {"cancelled": True, "reason": text}
 
 
-def max_queued_video_jobs_per_tenant() -> int:
-    """Maximum queued (pending) expensive video jobs allowed per tenant."""
-    return _positive_int_env(
-        "WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT",
-        DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT,
-    )
-
-
-def _resolve_tenant_id(tenant_id: str | None, payload: dict[str, Any] | None) -> str:
-    raw = tenant_id
-    if raw is None and isinstance(payload, dict):
-        raw = payload.get("tenant_id")
-    if raw is None:
-        return DEFAULT_TENANT_ID
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("tenant_id must be a non-empty string")
-    return raw.strip()
-
-
-def count_tenant_video_jobs(tenant_id: str, *, status: str) -> int:
-    """Count expensive video jobs for *tenant_id* currently in *status*."""
-    return sum(
-        1
-        for job in _JOBS.values()
-        if job.get("status") == status
-        and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES
-        and job.get("tenant_id", DEFAULT_TENANT_ID) == tenant_id
-    )
-
-
-def get_tenant_video_job_counts() -> dict[str, dict[str, int]]:
-    """Return per-tenant pending and running counts for expensive video jobs."""
-    counts: dict[str, dict[str, int]] = {}
-    for job in _JOBS.values():
-        if job.get("type") not in EXPENSIVE_VIDEO_JOB_TYPES:
-            continue
-        status = job.get("status")
-        if status not in ("pending", "running"):
-            continue
-        tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
-        bucket = counts.setdefault(tenant, {"pending": 0, "running": 0})
-        bucket[status] += 1
-    return counts
-
-
-def enqueue_job(
-    job_type: str,
-    payload: dict[str, Any],
-    *,
-    tenant_id: str | None = None,
-    max_queued_per_tenant: int | None = None,
-    deadline_at: datetime | None = None,
-    deadline_seconds: float | None = None,
-    now: datetime | None = None,
-) -> int:
-    """Enqueue a background job and return its job id.
-
-    Expensive video jobs (``embed``, ``extract``) are bounded per tenant via
-    ``max_queued_per_tenant`` (or ``WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT``).
-    Optional ``deadline_at`` / ``deadline_seconds`` preserve an independent
-    processing deadline on the job record.
-    """
+def enqueue_job(job_type: str, payload: dict[str, Any]) -> int:
+    """Enqueue a background job and return its job id."""
     global _next_job_id
     resolved_tenant = _resolve_tenant_id(tenant_id, payload)
 
@@ -1351,7 +1276,8 @@ def enqueue_job(
         "status": "pending",
         "result": None,
         "progress": None,
-        "created_at": current.isoformat(),
+        "retry_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if resolved_deadline is not None:
         record["deadline_at"] = resolved_deadline.isoformat()
@@ -1364,30 +1290,50 @@ def get_job(job_id: int) -> dict[str, Any] | None:
     return _JOBS.get(job_id)
 
 
-def cancel_job(job_id: int) -> bool:
-    """Cancel a pending job. Returns True on success."""
+def cancel_job(job_id: int, *, reason: str | None = None) -> bool:
+    """Cancel a pending or running job without affecting failure retry counts.
+
+    Preserves a stable cancelled result for the requester and records
+    ``cancelled_at``. Returns True when the job transitioned to ``cancelled``,
+    False when the job does not exist or is already in a terminal state.
+    """
     job = _JOBS.get(job_id)
-    if job and job["status"] == "pending":
+    if job and job.get("status") in ("pending", "running"):
         job["status"] = "cancelled"
+        job["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+        job["result"] = _cancelled_result(reason)
+        job.pop("worker_id", None)
         return True
     return False
 
 
-DEFAULT_HEARTBEAT_STALE_SECONDS = 300.0
-STALE_HEARTBEAT_REASON = "stale_worker_heartbeat"
-PROCESSING_STATE_CATEGORY = "processing_state"
+def mark_job_cancelled(job_id: int, reason: str | None = None) -> bool:
+    """Record intentional worker cancellation for a job.
+
+    Unlike :func:`fail_job`, cancellation never increments ``retry_count``,
+    never re-queues the job for automatic retry, and never sets failure fields
+    (``error`` / ``failed_at``). If the job is already ``cancelled``, its
+    existing ``cancelled_at`` and ``result`` are preserved unchanged.
+    """
+    job = _JOBS.get(job_id)
+    if not job:
+        return False
+    status = job.get("status")
+    if status == "cancelled":
+        if not isinstance(job.get("result"), dict) or job["result"].get("cancelled") is not True:
+            job["result"] = _cancelled_result(reason)
+        job.setdefault("cancelled_at", datetime.now(timezone.utc).isoformat())
+        job.pop("worker_id", None)
+        return True
+    if status in ("pending", "running"):
+        return cancel_job(job_id, reason=reason)
+    return False
 
 
-def _parse_iso_utc(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+def is_job_cancelled(job_id: int) -> bool:
+    """Return True when the job exists and is in the ``cancelled`` state."""
+    job = _JOBS.get(job_id)
+    return bool(job and job.get("status") == "cancelled")
 
 
 def _claim_is_current(job: dict[str, Any], generation: int | None, action: str) -> bool:
@@ -1668,6 +1614,7 @@ def reclaim_stale_jobs(
 # once per decoded frame); updates are stored at most once per this interval.
 JOB_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 JOB_PROGRESS_PHASE_MAX_LENGTH = 64
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 def report_job_progress(
@@ -1675,6 +1622,7 @@ def report_job_progress(
     phase: str,
     percent: float | None = None,
     *,
+    stage_revision: int | None = None,
     now: float | None = None,
     generation: int | None = None,
 ) -> bool:
@@ -2066,3 +2014,57 @@ def save_indexer_cursor(
                 (indexer_id, cursor, ledger),
             )
         connection.commit()
+
+
+def get_indexer_checkpoint_manifest(
+    indexer_id: str = "soroban_events",
+) -> dict[str, Any] | None:
+    """Return the stored checkpoint manifest dict for an indexer, if any."""
+    if not database_url():
+        state = _INDEXER_STATE.get(indexer_id)
+        if not state:
+            return None
+        manifest = state.get("manifest")
+        return dict(manifest) if isinstance(manifest, dict) else None
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "select cursor, ledger from indexer_state where id = %s;",
+                (indexer_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            raw_cursor = row.get("cursor")
+            if isinstance(raw_cursor, str) and raw_cursor.startswith("{"):
+                try:
+                    parsed = json.loads(raw_cursor)
+                    if isinstance(parsed, dict) and "manifest_hash" in parsed:
+                        return parsed
+                except Exception:
+                    return None
+            return None
+
+
+def save_indexer_checkpoint_manifest(
+    manifest: dict[str, Any],
+    indexer_id: str = "soroban_events",
+) -> None:
+    """Persist the verified checkpoint manifest alongside the indexer cursor."""
+    cursor_val = str(manifest.get("cursor") or "")
+    ledger_val = manifest.get("observed_ledger")
+    if not database_url():
+        _INDEXER_STATE[indexer_id] = {
+            "cursor": cursor_val,
+            "ledger": ledger_val,
+            "manifest": dict(manifest),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        return
+
+    save_indexer_cursor(
+        indexer_id=indexer_id,
+        cursor=cursor_val,
+        ledger=ledger_val if isinstance(ledger_val, int) else None,
+    )
